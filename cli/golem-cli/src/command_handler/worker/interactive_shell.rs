@@ -210,6 +210,37 @@ fn format_question(prompt: &PendingPrompt) -> String {
     }
 }
 
+/// Discard any keystrokes the terminal buffered while an invocation was in flight, so they are not
+/// replayed into the next inquire prompt. Between prompts the tty sits in cooked mode and queues
+/// everything typed; inquire has no "clear pending input" option, so the drain happens here, with
+/// crossterm's zero-timeout poll under a raw-mode guard (the same enable/disable pairing the REPL
+/// supervisor uses). Best-effort: any terminal error just skips the drain — worse output beats a
+/// broken shell.
+fn drain_typeahead() {
+    if crossterm::terminal::enable_raw_mode().is_err() {
+        return;
+    }
+    drain_events(
+        || matches!(crossterm::event::poll(std::time::Duration::ZERO), Ok(true)),
+        || crossterm::event::read().is_ok(),
+    );
+    let _ = crossterm::terminal::disable_raw_mode();
+}
+
+/// The drain loop over injected probes, separated for testability: `pending` reports whether an
+/// event is queued, `consume` reads one (returning false on failure, which stops the drain).
+/// Returns the number of events discarded.
+fn drain_events(mut pending: impl FnMut() -> bool, mut consume: impl FnMut() -> bool) -> usize {
+    let mut discarded = 0;
+    while pending() {
+        if !consume() {
+            break;
+        }
+        discarded += 1;
+    }
+    discarded
+}
+
 impl WorkerCommandHandler {
     /// Drive the interactive shell: read a line, invoke `eval`, render, resolve any pause, repeat.
     /// Runs until EOF (Ctrl-D), Ctrl-C, or `exit`.
@@ -300,11 +331,22 @@ impl WorkerCommandHandler {
         };
 
         let clients = self.ctx.golem_clients().await?;
+        logln(
+            format!("… invoking {method} (typed input during the run is discarded)")
+                .log_color_highlight()
+                .to_string(),
+        );
         let result = clients
             .agent
             .invoke_agent(Some(&idempotency_key.value), &request)
-            .await
-            .map_service_error()?;
+            .await;
+        // While the invocation was in flight there was no prompt on screen, but the terminal (in
+        // cooked mode between inquire prompts) kept buffering keystrokes — without a drain they
+        // replay into the NEXT prompt, so commands typed during a long `eval` (a ~30s multi-turn
+        // `ask`) land against later lines and the session looks reordered. Discard them on every
+        // path, success or error, before anything re-prompts.
+        drain_typeahead();
+        let result = result.map_service_error()?;
 
         let typed = result.result.ok_or_else(|| {
             anyhow!(
@@ -686,5 +728,30 @@ mod tests {
             err.contains("answer_prompt") && err.contains("abort_prompt"),
             "err: {err}"
         );
+    }
+
+    #[test]
+    fn drain_consumes_every_pending_event() {
+        let queued = std::cell::Cell::new(3usize);
+        let discarded = drain_events(
+            || queued.get() > 0,
+            || {
+                queued.set(queued.get() - 1);
+                true
+            },
+        );
+        assert_eq!(discarded, 3);
+        assert_eq!(queued.get(), 0);
+    }
+
+    #[test]
+    fn drain_with_nothing_pending_is_a_noop() {
+        assert_eq!(drain_events(|| false, || panic!("must not read")), 0);
+    }
+
+    #[test]
+    fn drain_stops_on_a_failed_read() {
+        // `pending` forever true, but the first read fails: the drain must bail, not spin.
+        assert_eq!(drain_events(|| true, || false), 0);
     }
 }
