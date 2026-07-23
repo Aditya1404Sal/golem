@@ -19,7 +19,8 @@
 //!
 //! Nothing here is specific to any one agent: the surface is validated structurally, the line is
 //! shipped verbatim, and the prompt label derives from the agent type ([`shell_prompt_label`] —
-//! `ClankAgent` shows `clank$`, `RandomAgent` shows `random$`).
+//! `ClankAgent` shows `clank`, `RandomAgent` shows `random`), terminated by a starship-style `❯`
+//! indicator that is green after a successful command and red after a failure ([`shell_render_config`]).
 //!
 //! **The contract.** `agent shell` requires a **durable** agent type exposing three methods, named
 //! exactly as written (snake_case is normative — the surface is matched against the reflected method
@@ -53,6 +54,7 @@ use golem_common::model::agent::AgentMode;
 use golem_common::model::agent::ParsedAgentId;
 use golem_common::schema::agent::{AgentMethodSchema, AgentTypeSchema, InputSchema};
 use golem_common::schema::{FromSchema, SchemaType, SchemaValue};
+use inquire::ui::{Attributes, Color, RenderConfig, StyleSheet, Styled};
 use inquire::{InquireError, Select, Text};
 
 use super::WorkerCommandHandler;
@@ -186,18 +188,43 @@ fn render(result: &EvalResult) -> String {
 }
 
 /// The shell's prompt label, derived from the agent type so the surface reads as the agent's own:
-/// kebab-case the type name, drop a trailing `-agent` (the conventional suffix carries no
-/// information at a shell prompt), and append `$`. `ClankAgent` → `clank$`, `GreeterAgent` →
-/// `greeter$`, `RpcCounter` → `rpc-counter$`. A type named literally `Agent` (or an empty name)
-/// falls back to `agent$`.
+/// kebab-case the type name and drop a trailing `-agent` (the conventional suffix carries no
+/// information at a shell prompt). `ClankAgent` → `clank`, `GreeterAgent` → `greeter`, `RpcCounter`
+/// → `rpc-counter`. A type named literally `Agent` (or an empty name) falls back to `agent`. The
+/// prompt is terminated by the `❯` indicator ([`shell_render_config`]), so the label carries no `$`.
 fn shell_prompt_label(type_name: &str) -> String {
     let kebab = heck::ToKebabCase::to_kebab_case(type_name);
     let stem = kebab.strip_suffix("-agent").unwrap_or(&kebab);
     if stem.is_empty() {
-        "agent$".to_string()
+        "agent".to_string()
     } else {
-        format!("{stem}$")
+        stem.to_string()
     }
+}
+
+/// inquire styling for the command prompt: a starship-style `❯` indicator replacing inquire's
+/// default `?`, **green** when the previous command succeeded and **red** when it failed, with the
+/// agent label in bold cyan. Rebuilt for each line so the indicator tracks the last exit code.
+fn shell_render_config(ok: bool) -> RenderConfig<'static> {
+    let indicator = if ok {
+        Color::LightGreen
+    } else {
+        Color::LightRed
+    };
+    let mut config = RenderConfig::default()
+        .with_prompt_prefix(Styled::new("❯").with_fg(indicator))
+        .with_answered_prompt_prefix(Styled::new("❯").with_fg(Color::DarkGrey));
+    config.prompt = StyleSheet::new()
+        .with_fg(Color::LightCyan)
+        .with_attr(Attributes::BOLD);
+    config
+}
+
+/// inquire styling for a human-answer sub-prompt (the `answer:` line / choice picker a pending
+/// question raises): the same `❯` indicator in a neutral colour, visually distinct from the
+/// command line so it is clear the shell is waiting on an answer, not a command.
+fn answer_render_config() -> RenderConfig<'static> {
+    RenderConfig::default().with_prompt_prefix(Styled::new("❯").with_fg(Color::DarkYellow))
 }
 
 /// Format a pending question for display, appending its allowed answers when it has them.
@@ -260,8 +287,13 @@ impl WorkerCommandHandler {
         logln("");
 
         let prompt = shell_prompt_label(&agent_type.type_name.0);
+        // Drives the prompt's `❯` colour: green after a success, red after a failure.
+        let mut last_ok = true;
         loop {
-            let line = match Text::new(&prompt).prompt() {
+            let line = match Text::new(&prompt)
+                .with_render_config(shell_render_config(last_ok))
+                .prompt()
+            {
                 Ok(line) => line,
                 // Ctrl-D / Esc / Ctrl-C are ordinary ways to leave a shell, not errors.
                 Err(InquireError::OperationCanceled | InquireError::OperationInterrupted) => break,
@@ -289,12 +321,15 @@ impl WorkerCommandHandler {
                 Ok(result) => result,
                 Err(err) => {
                     log_error(format!("{err:#}"));
+                    last_ok = false;
                     continue;
                 }
             };
 
-            self.render_and_resolve(agent_name_match, agent_type, agent_id, result)
-                .await;
+            last_ok = self
+                .render_and_resolve(agent_name_match, agent_type, agent_id, result)
+                .await
+                == 0;
         }
 
         Ok(())
@@ -331,11 +366,6 @@ impl WorkerCommandHandler {
         };
 
         let clients = self.ctx.golem_clients().await?;
-        logln(
-            format!("… invoking {method} (typed input during the run is discarded)")
-                .log_color_highlight()
-                .to_string(),
-        );
         let result = clients
             .agent
             .invoke_agent(Some(&idempotency_key.value), &request)
@@ -365,13 +395,15 @@ impl WorkerCommandHandler {
     }
 
     /// Print a result and, while it carries a pending question, ask the human and deliver the answer.
+    /// Returns the final exit code (so the caller can colour the next prompt's indicator); a failure
+    /// to invoke or to read an answer returns a non-zero code.
     async fn render_and_resolve(
         &self,
         agent_name_match: &AgentNameMatch,
         agent_type: &AgentTypeSchema,
         agent_id: &ParsedAgentId,
         mut result: EvalResult,
-    ) {
+    ) -> u8 {
         loop {
             let output = render(&result);
             if !output.is_empty() {
@@ -379,7 +411,7 @@ impl WorkerCommandHandler {
             }
 
             let Some(prompt) = result.pending_prompt.take() else {
-                return;
+                return result.exit_code;
             };
 
             let (method, argument) = match self.ask_human(&prompt) {
@@ -387,7 +419,7 @@ impl WorkerCommandHandler {
                 Ok(None) => (ABORT_PROMPT, None),
                 Err(err) => {
                     log_error(format!("{err:#}"));
-                    return;
+                    return 1;
                 }
             };
 
@@ -398,7 +430,7 @@ impl WorkerCommandHandler {
                 Ok(result) => result,
                 Err(err) => {
                     log_error(format!("{err:#}"));
-                    return;
+                    return 1;
                 }
             };
         }
@@ -412,9 +444,13 @@ impl WorkerCommandHandler {
             Some(choices) if !choices.is_empty() => {
                 let mut options = choices.clone();
                 options.push(ABORT_ANSWER.to_string());
-                Select::new("answer:", options).prompt()
+                Select::new("answer:", options)
+                    .with_render_config(answer_render_config())
+                    .prompt()
             }
-            _ => Text::new(&format!("answer (`{ABORT_ANSWER}` to cancel):")).prompt(),
+            _ => Text::new(&format!("answer (`{ABORT_ANSWER}` to cancel):"))
+                .with_render_config(answer_render_config())
+                .prompt(),
         };
 
         match answer {
@@ -580,21 +616,34 @@ mod tests {
 
     #[test]
     fn prompt_label_drops_the_agent_suffix() {
-        assert_eq!(shell_prompt_label("ClankAgent"), "clank$");
-        assert_eq!(shell_prompt_label("GreeterAgent"), "greeter$");
+        assert_eq!(shell_prompt_label("ClankAgent"), "clank");
+        assert_eq!(shell_prompt_label("GreeterAgent"), "greeter");
     }
 
     #[test]
     fn prompt_label_kebab_cases_multiword_names() {
-        assert_eq!(shell_prompt_label("RpcCounter"), "rpc-counter$");
-        assert_eq!(shell_prompt_label("RevisionEnvAgent"), "revision-env$");
+        assert_eq!(shell_prompt_label("RpcCounter"), "rpc-counter");
+        assert_eq!(shell_prompt_label("RevisionEnvAgent"), "revision-env");
     }
 
     #[test]
     fn prompt_label_never_goes_empty() {
         // A type named literally `Agent` must not strip down to nothing.
-        assert_eq!(shell_prompt_label("Agent"), "agent$");
-        assert_eq!(shell_prompt_label(""), "agent$");
+        assert_eq!(shell_prompt_label("Agent"), "agent");
+        assert_eq!(shell_prompt_label(""), "agent");
+    }
+
+    #[test]
+    fn shell_prompt_indicator_tracks_the_last_exit() {
+        // Green ❯ after a success, red ❯ after a failure.
+        assert_eq!(
+            shell_render_config(true).prompt_prefix.style.fg,
+            Some(Color::LightGreen)
+        );
+        assert_eq!(
+            shell_render_config(false).prompt_prefix.style.fg,
+            Some(Color::LightRed)
+        );
     }
 
     // --- validate_interactive_surface -------------------------------------------------------
