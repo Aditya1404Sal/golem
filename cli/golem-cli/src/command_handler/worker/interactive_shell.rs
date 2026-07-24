@@ -400,6 +400,45 @@ fn draw_clank_loader(tick: u64) {
     let _ = std::io::stderr().flush();
 }
 
+/// Await a command `eval` while showing a minimal `⣾ {thinking|working}… {n}s` ticker, so a slow
+/// invocation — above all a multi-second `ask` (which runs as one atomic eval, returning nothing
+/// until it finishes) — reads as working, not frozen. Only on a terminal, and only after ~350ms so
+/// quick commands never flash it. Label is `thinking` for an `ask`, else `working`. Cleared before
+/// the result renders. (The connect warm-up keeps its own richer [`with_clank_loader`].)
+async fn with_thinking_ticker<F: std::future::Future>(fut: F, is_ask: bool) -> F::Output {
+    use std::io::{IsTerminal, Write};
+    if !std::io::stderr().is_terminal() {
+        return fut.await;
+    }
+    let label = if is_ask { "thinking" } else { "working" };
+    const SPIN: [&str; 8] = ["⣾", "⣽", "⣻", "⢿", "⡿", "⣟", "⣯", "⣷"];
+    let start = std::time::Instant::now();
+    tokio::pin!(fut);
+    let (mut frame, mut shown) = (0usize, false);
+    let out = loop {
+        tokio::select! {
+            biased;
+            r = &mut fut => break r,
+            () = tokio::time::sleep(std::time::Duration::from_millis(110)) => {
+                let elapsed = start.elapsed();
+                if elapsed < std::time::Duration::from_millis(350) {
+                    continue;
+                }
+                shown = true;
+                let spin = SPIN[frame % SPIN.len()];
+                frame += 1;
+                eprint!("\r\x1b[96m{spin}\x1b[0m {label}\u{2026} {}s\x1b[K", elapsed.as_secs());
+                let _ = std::io::stderr().flush();
+            }
+        }
+    };
+    if shown {
+        eprint!("\r\x1b[2K");
+        let _ = std::io::stderr().flush();
+    }
+    out
+}
+
 impl WorkerCommandHandler {
     /// Drive the interactive shell: read a line, invoke `eval`, render, resolve any pause, repeat.
     /// Runs until EOF (Ctrl-D), Ctrl-C, or `exit`.
@@ -483,15 +522,18 @@ impl WorkerCommandHandler {
                     .await;
             }
 
-            let (result, invoke_cwd) = match self
-                .interactive_invoke(
+            let is_ask = line.split_whitespace().next() == Some("ask");
+            let (result, invoke_cwd) = match with_thinking_ticker(
+                self.interactive_invoke(
                     agent_name_match,
                     agent_type,
                     agent_id,
                     EVAL,
                     Some(line.to_string()),
-                )
-                .await
+                ),
+                is_ask,
+            )
+            .await
             {
                 Ok(pair) => pair,
                 Err(err) => {
