@@ -322,6 +322,13 @@ fn drain_events(mut pending: impl FnMut() -> bool, mut consume: impl FnMut() -> 
     discarded
 }
 
+/// The client terminal's width in columns, or 80 when it can't be determined. Sent to the agent as
+/// `export COLUMNS=<w>` so a terminal-style `ls` (and other columnar output) fills the real window —
+/// the agent has no terminal of its own to measure.
+fn term_width() -> u16 {
+    crossterm::terminal::size().map_or(80, |(cols, _)| cols)
+}
+
 impl WorkerCommandHandler {
     /// Drive the interactive shell: read a line, invoke `eval`, render, resolve any pause, repeat.
     /// Runs until EOF (Ctrl-D), Ctrl-C, or `exit`.
@@ -348,20 +355,20 @@ impl WorkerCommandHandler {
         let prefix = label_prefix(&label, color);
         // Drives the `❯` marker colour: green after a success, red after a failure.
         let mut last_ok = true;
-        // The agent's working directory, tracked across the session so the prompt reflects `cd`.
-        // Seed it up front so the FIRST prompt already shows it (like a real terminal): a no-op
-        // `eval("")` returns the agent's cwd — agents stamp it on every eval-result — without
-        // running a command or emitting output. Best-effort and silent: the result is discarded
-        // (any dangling prompt it re-surfaces stays pending and is picked up by the first real
-        // command, exactly as before), and on any error, or an agent that reports no cwd, the
-        // first prompt is simply the bare label.
+        // Sync the agent's COLUMNS to the client terminal width so a terminal-style `ls` fills the
+        // window (the agent has no terminal of its own to measure). This also seeds the cwd: `export`
+        // is a real eval, so its result still carries the agent's cwd — so the FIRST prompt shows it,
+        // exactly as the old `eval("")` seed did. Best-effort and silent (result discarded); any
+        // dangling prompt it re-surfaces is picked up by the first real command, and a no-cwd agent
+        // just gets the bare label.
+        let mut last_cols = term_width();
         let mut cwd: Option<String> = match self
             .interactive_invoke(
                 agent_name_match,
                 agent_type,
                 agent_id,
                 EVAL,
-                Some(String::new()),
+                Some(format!("export COLUMNS={last_cols}")),
             )
             .await
         {
@@ -386,6 +393,22 @@ impl WorkerCommandHandler {
             }
             if line.is_empty() {
                 continue;
+            }
+
+            // Keep the agent's COLUMNS in sync when the client window was resized between commands,
+            // so the next `ls` reflows. Silent and best-effort; only re-sent when the width changed.
+            let cols = term_width();
+            if cols != last_cols {
+                last_cols = cols;
+                let _ = self
+                    .interactive_invoke(
+                        agent_name_match,
+                        agent_type,
+                        agent_id,
+                        EVAL,
+                        Some(format!("export COLUMNS={cols}")),
+                    )
+                    .await;
             }
 
             let (result, invoke_cwd) = match self
