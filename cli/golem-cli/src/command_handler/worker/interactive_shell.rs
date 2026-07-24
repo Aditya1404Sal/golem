@@ -329,6 +329,77 @@ fn term_width() -> u16 {
     crossterm::terminal::size().map_or(80, |(cols, _)| cols)
 }
 
+/// Await `fut` while animating a `clank`-themed loader in place, so the one-time cold start of a
+/// fresh agent instance (loading + instantiating the wasm, building the shell) reads as "warming up"
+/// rather than a hang. No animation when stderr isn't a terminal (piped/scripted) — the future is
+/// just awaited. The loader line is cleared before returning, so the prompt draws cleanly after.
+async fn with_clank_loader<F: std::future::Future>(fut: F) -> F::Output {
+    use std::io::{IsTerminal, Write};
+    if !std::io::stderr().is_terminal() {
+        return fut.await;
+    }
+    draw_clank_loader(0);
+    tokio::pin!(fut);
+    let mut tick = 1u64;
+    let out = loop {
+        tokio::select! {
+            biased;
+            r = &mut fut => break r,
+            () = tokio::time::sleep(std::time::Duration::from_millis(90)) => {
+                draw_clank_loader(tick);
+                tick += 1;
+            }
+        }
+    };
+    // Carriage return + erase-to-end-of-line, so the prompt starts on a clean line.
+    eprint!("\r\x1b[2K");
+    let _ = std::io::stderr().flush();
+    out
+}
+
+/// One frame of the loader: a braille spinner, a cycling `clank`-themed status, and an indeterminate
+/// pulse bar whose lit window bounces back and forth. Redrawn in place with a carriage return.
+fn draw_clank_loader(tick: u64) {
+    use std::io::Write;
+    const SPIN: [&str; 8] = ["⣾", "⣽", "⣻", "⢿", "⡿", "⣟", "⣯", "⣷"];
+    const MSG: [&str; 7] = [
+        "initializing clank",
+        "clanking the parts together",
+        "greasing the gears",
+        "warming up the shell",
+        "tightening the bolts",
+        "spinning up the agent",
+        "almost there",
+    ];
+    let t = tick as usize;
+    let spin = SPIN[t % SPIN.len()];
+    let msg = MSG[(t / 16) % MSG.len()]; // ~1.5s per message at 90ms/frame
+    // Pulse bar: a 3-cell lit window bounces across `width` cells (indeterminate progress).
+    let (width, window) = (14usize, 3usize);
+    let span = (width - window) * 2;
+    let phase = t % span;
+    let pos = if phase <= width - window {
+        phase
+    } else {
+        span - phase
+    };
+    let bar: String = (0..width)
+        .map(|i| {
+            if i >= pos && i < pos + window {
+                '█'
+            } else {
+                '·'
+            }
+        })
+        .collect();
+    if colored::control::SHOULD_COLORIZE.should_colorize() {
+        eprint!("\r\x1b[96m{spin}\x1b[0m \x1b[1m{msg}\x1b[0m \x1b[90m▕{bar}▏\x1b[0m\x1b[K");
+    } else {
+        eprint!("\r{spin} {msg} [{bar}]\x1b[K");
+    }
+    let _ = std::io::stderr().flush();
+}
+
 impl WorkerCommandHandler {
     /// Drive the interactive shell: read a line, invoke `eval`, render, resolve any pause, repeat.
     /// Runs until EOF (Ctrl-D), Ctrl-C, or `exit`.
@@ -362,15 +433,16 @@ impl WorkerCommandHandler {
         // dangling prompt it re-surfaces is picked up by the first real command, and a no-cwd agent
         // just gets the bare label.
         let mut last_cols = term_width();
-        let mut cwd: Option<String> = match self
-            .interactive_invoke(
-                agent_name_match,
-                agent_type,
-                agent_id,
-                EVAL,
-                Some(format!("export COLUMNS={last_cols}")),
-            )
-            .await
+        // The seed is the first invocation on a fresh instance, so it pays the agent's cold start
+        // (~seconds). Animate a `clank` loader over it so the wait reads as work, not a hang.
+        let mut cwd: Option<String> = match with_clank_loader(self.interactive_invoke(
+            agent_name_match,
+            agent_type,
+            agent_id,
+            EVAL,
+            Some(format!("export COLUMNS={last_cols}")),
+        ))
+        .await
         {
             Ok((_, seeded)) => seeded,
             Err(_) => None,
