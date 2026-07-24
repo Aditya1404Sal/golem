@@ -551,6 +551,9 @@ impl WorkerCommandHandler {
             if final_cwd.is_some() {
                 cwd = final_cwd;
             }
+            // A blank line after each command's output so the next prompt has room to breathe and
+            // doesn't sit flush against the result — a consistent, terminal-like rhythm.
+            logln("");
         }
 
         Ok(())
