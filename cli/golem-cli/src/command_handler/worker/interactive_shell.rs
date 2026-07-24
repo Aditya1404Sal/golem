@@ -17,10 +17,11 @@
 //! The sibling of `agent stream` rather than a mode of it: `stream` tails the agent's output channels
 //! one-way, whereas this invokes the agent and renders what comes back.
 //!
-//! Nothing here is specific to any one agent: the surface is validated structurally, the line is
-//! shipped verbatim, and the prompt label derives from the agent type ([`shell_prompt_label`] —
-//! `ClankAgent` shows `clank`, `RandomAgent` shows `random`), terminated by a starship-style `❯`
-//! indicator that is green after a successful command and red after a failure ([`shell_render_config`]).
+//! Nothing here is specific to any one agent: the surface is validated structurally and the line is
+//! shipped verbatim. The prompt reads `clank [/cwd] ❯` — the agent-derived label
+//! ([`shell_prompt_label`] — `ClankAgent` shows `clank`, `RandomAgent` shows `random`), the working
+//! directory in blue brackets when the agent reports one, and a starship-style `❯` marker right
+//! before the input that is green after a success / red after a failure ([`prompt_message`]).
 //!
 //! **The contract.** `agent shell` requires a **durable** agent type exposing three methods, named
 //! exactly as written (snake_case is normative — the surface is matched against the reflected method
@@ -33,7 +34,10 @@
 //! | `abort_prompt` | `() -> eval-result` | cancel an outstanding question |
 //!
 //! where `eval-result` is the record `{ stdout: string, stderr: string, exit-code: u8,
-//! pending-prompt: option<{ question: string, choices: option<list<string>> }> }`.
+//! pending-prompt: option<{ question: string, choices: option<list<string>> }> }`. An agent MAY
+//! append a fifth `cwd: string` field; when present the shell shows it in blue brackets before the
+//! `❯` marker so a `cd` is reflected (`clank ❯` → `clank [/app] ❯`). The record is decoded
+//! positionally and the extra field is read optionally, so agents that omit it are entirely unaffected.
 //!
 //! An agent that does not present that surface gets a clear error, and **every agent is otherwise
 //! unaffected** — `stream` log-streams exactly as before. Ephemeral agent types are rejected up
@@ -54,7 +58,7 @@ use golem_common::model::agent::AgentMode;
 use golem_common::model::agent::ParsedAgentId;
 use golem_common::schema::agent::{AgentMethodSchema, AgentTypeSchema, InputSchema};
 use golem_common::schema::{FromSchema, SchemaType, SchemaValue};
-use inquire::ui::{Attributes, Color, RenderConfig, StyleSheet, Styled};
+use inquire::ui::{Color, RenderConfig, Styled};
 use inquire::{InquireError, Select, Text};
 
 use super::WorkerCommandHandler;
@@ -89,6 +93,23 @@ struct PendingPrompt {
     question: String,
     /// When present, the answer must be one of these.
     choices: Option<Vec<String>>,
+}
+
+/// Pull the optional working directory an agent MAY report as a **fifth** eval-result field.
+///
+/// The surface contract is `{ stdout, stderr, exit-code, pending-prompt }`; an agent may append a
+/// `cwd: string` so the shell can show where it is and reflect a `cd` (clank does). The record is
+/// decoded positionally and [`EvalResult`]'s derive ignores trailing fields, so this reads index 4
+/// directly and yields `None` for any agent that omits it (or reports an empty path). Keeping it
+/// optional is what lets `agent shell` stay generic across agents that predate the field.
+fn extract_cwd(value: &SchemaValue) -> Option<String> {
+    match value {
+        SchemaValue::Record { fields } => match fields.get(4) {
+            Some(SchemaValue::String(cwd)) if !cwd.is_empty() => Some(cwd.clone()),
+            _ => None,
+        },
+        _ => None,
+    }
 }
 
 /// Whether `agent_type` presents the interactive-shell surface, and why not if it doesn't.
@@ -202,22 +223,55 @@ fn shell_prompt_label(type_name: &str) -> String {
     }
 }
 
-/// inquire styling for the command prompt: a starship-style `❯` indicator replacing inquire's
-/// default `?`, **green** when the previous command succeeded and **red** when it failed, with the
-/// agent label in bold cyan. Rebuilt for each line so the indicator tracks the last exit code.
-fn shell_render_config(ok: bool) -> RenderConfig<'static> {
-    let indicator = if ok {
-        Color::LightGreen
+/// ANSI reset — closes a colour span opened in a prompt segment (see [`prompt_message`]).
+const ANSI_RESET: &str = "\x1b[0m";
+
+/// The agent [label](shell_prompt_label) as the prompt's leading segment — bold bright-cyan when
+/// `color`, plain otherwise. It goes in the render config's prefix so inquire places it first and
+/// adds the separating space; the embedded ANSI renders verbatim (inquire excludes escapes from its
+/// width math). `color` gates the escapes so the label is plain under NO_COLOR / a non-tty.
+fn label_prefix(label: &str, color: bool) -> String {
+    if color {
+        format!("\x1b[1;96m{label}{ANSI_RESET}")
     } else {
-        Color::LightRed
+        label.to_string()
+    }
+}
+
+/// The prompt message that renders right before the input: the working directory in blue brackets
+/// (when the agent reports one) then the `❯` marker — bright-green after a success, bright-red after
+/// a failure. It is baked into the MESSAGE, not the render config, because inquire has no marker
+/// slot between the message and the input; it renders the embedded ANSI without disturbing cursor
+/// alignment (escapes are excluded from its width math). A `None`/empty cwd yields just the marker
+/// (→ `clank ❯`). `color` gates every escape so the string is plain under NO_COLOR / a non-tty.
+fn prompt_message(cwd: Option<&str>, ok: bool, color: bool) -> String {
+    let marker = match (color, ok) {
+        (false, _) => "❯".to_string(),
+        (true, true) => format!("\x1b[92m❯{ANSI_RESET}"),
+        (true, false) => format!("\x1b[91m❯{ANSI_RESET}"),
     };
-    let mut config = RenderConfig::default()
-        .with_prompt_prefix(Styled::new("❯").with_fg(indicator))
-        .with_answered_prompt_prefix(Styled::new("❯").with_fg(Color::DarkGrey));
-    config.prompt = StyleSheet::new()
-        .with_fg(Color::LightCyan)
-        .with_attr(Attributes::BOLD);
-    config
+    match cwd {
+        Some(cwd) if !cwd.is_empty() => {
+            let cwd = if color {
+                format!("\x1b[34m[{cwd}]{ANSI_RESET}")
+            } else {
+                format!("[{cwd}]")
+            };
+            format!("{cwd} {marker}")
+        }
+        _ => marker,
+    }
+}
+
+/// inquire styling for the command prompt: the agent label ([`label_prefix`]) leads as the prefix —
+/// inquire appends the separating space and renders the label's own ANSI verbatim. The cwd and `❯`
+/// marker come from the message ([`prompt_message`]) so the marker sits right before the input, and
+/// `render_config.prompt` is left at its empty default so inquire does not re-wrap that ANSI. The
+/// answered prefix reuses the label so submitted (history) lines read identically.
+fn shell_render_config(prefix: &str) -> RenderConfig<'_> {
+    RenderConfig::default()
+        .with_prompt_prefix(Styled::new(prefix))
+        .with_answered_prompt_prefix(Styled::new(prefix))
 }
 
 /// inquire styling for a human-answer sub-prompt (the `answer:` line / choice picker a pending
@@ -286,12 +340,38 @@ impl WorkerCommandHandler {
         );
         logln("");
 
-        let prompt = shell_prompt_label(&agent_type.type_name.0);
-        // Drives the prompt's `❯` colour: green after a success, red after a failure.
+        let label = shell_prompt_label(&agent_type.type_name.0);
+        // Colour gating: reuse `colored`'s decision (NO_COLOR / CLICOLOR / tty) so the prompt matches
+        // the rest of the CLI's output. The label prefix is fixed for the session; the cwd + `❯`
+        // marker are rebuilt each line.
+        let color = colored::control::SHOULD_COLORIZE.should_colorize();
+        let prefix = label_prefix(&label, color);
+        // Drives the `❯` marker colour: green after a success, red after a failure.
         let mut last_ok = true;
+        // The agent's working directory, tracked across the session so the prompt reflects `cd`.
+        // Seed it up front so the FIRST prompt already shows it (like a real terminal): a no-op
+        // `eval("")` returns the agent's cwd — agents stamp it on every eval-result — without
+        // running a command or emitting output. Best-effort and silent: the result is discarded
+        // (any dangling prompt it re-surfaces stays pending and is picked up by the first real
+        // command, exactly as before), and on any error, or an agent that reports no cwd, the
+        // first prompt is simply the bare label.
+        let mut cwd: Option<String> = match self
+            .interactive_invoke(
+                agent_name_match,
+                agent_type,
+                agent_id,
+                EVAL,
+                Some(String::new()),
+            )
+            .await
+        {
+            Ok((_, seeded)) => seeded,
+            Err(_) => None,
+        };
         loop {
-            let line = match Text::new(&prompt)
-                .with_render_config(shell_render_config(last_ok))
+            let message = prompt_message(cwd.as_deref(), last_ok, color);
+            let line = match Text::new(&message)
+                .with_render_config(shell_render_config(&prefix))
                 .prompt()
             {
                 Ok(line) => line,
@@ -308,7 +388,7 @@ impl WorkerCommandHandler {
                 continue;
             }
 
-            let result = match self
+            let (result, invoke_cwd) = match self
                 .interactive_invoke(
                     agent_name_match,
                     agent_type,
@@ -318,7 +398,7 @@ impl WorkerCommandHandler {
                 )
                 .await
             {
-                Ok(result) => result,
+                Ok(pair) => pair,
                 Err(err) => {
                     log_error(format!("{err:#}"));
                     last_ok = false;
@@ -326,16 +406,22 @@ impl WorkerCommandHandler {
                 }
             };
 
-            last_ok = self
-                .render_and_resolve(agent_name_match, agent_type, agent_id, result)
-                .await
-                == 0;
+            let (exit_code, final_cwd) = self
+                .render_and_resolve(agent_name_match, agent_type, agent_id, result, invoke_cwd)
+                .await;
+            last_ok = exit_code == 0;
+            // Keep the last reported cwd if this turn didn't carry one (e.g. an errored answer).
+            if final_cwd.is_some() {
+                cwd = final_cwd;
+            }
         }
 
         Ok(())
     }
 
-    /// Invoke one method with an optional single string argument, and decode its [`EvalResult`].
+    /// Invoke one method with an optional single string argument, decode its [`EvalResult`], and
+    /// pull the optional working directory it may report ([`extract_cwd`]) so the caller can track
+    /// it in the prompt.
     async fn interactive_invoke(
         &self,
         agent_name_match: &AgentNameMatch,
@@ -343,7 +429,7 @@ impl WorkerCommandHandler {
         agent_id: &ParsedAgentId,
         method: &str,
         argument: Option<String>,
-    ) -> anyhow::Result<EvalResult> {
+    ) -> anyhow::Result<(EvalResult, Option<String>)> {
         let method_parameters = SchemaValue::Record {
             fields: argument.into_iter().map(SchemaValue::String).collect(),
         };
@@ -386,24 +472,31 @@ impl WorkerCommandHandler {
             )
         })?;
 
-        EvalResult::from_value(typed.value()).map_err(|err| {
+        let value = typed.value();
+        let decoded = EvalResult::from_value(value).map_err(|err| {
             anyhow!(
                 "Could not decode the eval-result returned by `{method}` on agent type {}: {err}",
                 agent_type.type_name.0
             )
-        })
+        })?;
+        // Optional trailing `cwd` (5th field): agents that predate it return four fields → `None`.
+        let cwd = extract_cwd(value);
+        Ok((decoded, cwd))
     }
 
     /// Print a result and, while it carries a pending question, ask the human and deliver the answer.
-    /// Returns the final exit code (so the caller can colour the next prompt's indicator); a failure
-    /// to invoke or to read an answer returns a non-zero code.
+    /// Returns the final exit code (so the caller can colour the next prompt's indicator) and the
+    /// last working directory the agent reported (so the caller can track it in the prompt); a
+    /// failure to invoke or to read an answer returns a non-zero code and the cwd known so far.
+    /// `cwd` threads in the directory from the invocation that produced `result`.
     async fn render_and_resolve(
         &self,
         agent_name_match: &AgentNameMatch,
         agent_type: &AgentTypeSchema,
         agent_id: &ParsedAgentId,
         mut result: EvalResult,
-    ) -> u8 {
+        mut cwd: Option<String>,
+    ) -> (u8, Option<String>) {
         loop {
             let output = render(&result);
             if !output.is_empty() {
@@ -411,7 +504,7 @@ impl WorkerCommandHandler {
             }
 
             let Some(prompt) = result.pending_prompt.take() else {
-                return result.exit_code;
+                return (result.exit_code, cwd);
             };
 
             let (method, argument) = match self.ask_human(&prompt) {
@@ -419,20 +512,25 @@ impl WorkerCommandHandler {
                 Ok(None) => (ABORT_PROMPT, None),
                 Err(err) => {
                     log_error(format!("{err:#}"));
-                    return 1;
+                    return (1, cwd);
                 }
             };
 
-            result = match self
+            let (next, next_cwd) = match self
                 .interactive_invoke(agent_name_match, agent_type, agent_id, method, argument)
                 .await
             {
-                Ok(result) => result,
+                Ok(pair) => pair,
                 Err(err) => {
                     log_error(format!("{err:#}"));
-                    return 1;
+                    return (1, cwd);
                 }
             };
+            result = next;
+            // Resolving a prompt can also change directory; keep the freshest reported cwd.
+            if next_cwd.is_some() {
+                cwd = next_cwd;
+            }
         }
     }
 
@@ -552,6 +650,70 @@ mod tests {
         assert!(EvalResult::from_value(&value).is_err());
     }
 
+    /// Append a fifth `cwd` field to a 4-field eval-result record (what a cwd-reporting agent sends).
+    fn with_cwd(base: SchemaValue, cwd: &str) -> SchemaValue {
+        let SchemaValue::Record { mut fields } = base else {
+            unreachable!("eval_result_value builds a Record")
+        };
+        fields.push(SchemaValue::String(cwd.to_string()));
+        SchemaValue::Record { fields }
+    }
+
+    #[test]
+    fn extract_cwd_reads_the_fifth_field() {
+        let value = with_cwd(eval_result_value("hi\n", "", 0, None), "/app");
+        assert_eq!(extract_cwd(&value), Some("/app".to_string()));
+    }
+
+    #[test]
+    fn extract_cwd_is_none_for_a_four_field_agent() {
+        // The generic contract: an agent that omits cwd (four fields) yields None, never an error.
+        let value = eval_result_value("hi\n", "", 0, None);
+        assert_eq!(extract_cwd(&value), None);
+    }
+
+    #[test]
+    fn extract_cwd_treats_empty_as_absent() {
+        let value = with_cwd(eval_result_value("", "", 0, None), "");
+        assert_eq!(extract_cwd(&value), None);
+    }
+
+    #[test]
+    fn a_five_field_result_still_decodes_its_core_fields() {
+        // The positional derive ignores the trailing cwd field, so the core EvalResult is unchanged.
+        let value = with_cwd(eval_result_value("out\n", "err\n", 3, None), "/tmp");
+        let result = EvalResult::from_value(&value).expect("decode ignores the trailing field");
+        assert_eq!(result.stdout, "out\n");
+        assert_eq!(result.stderr, "err\n");
+        assert_eq!(result.exit_code, 3);
+        assert_eq!(extract_cwd(&value), Some("/tmp".to_string()));
+    }
+
+    #[test]
+    fn prompt_message_brackets_the_cwd_before_the_marker() {
+        // Colour off → deterministic plain text: `[cwd]` then the `❯` marker, in that order.
+        assert_eq!(prompt_message(Some("/app"), true, false), "[/app] ❯");
+    }
+
+    #[test]
+    fn prompt_message_is_just_the_marker_without_a_cwd() {
+        assert_eq!(prompt_message(None, true, false), "❯");
+        assert_eq!(prompt_message(Some(""), true, false), "❯");
+    }
+
+    #[test]
+    fn prompt_message_honours_no_colour() {
+        // color=false emits zero escape bytes, with or without a cwd.
+        assert!(!prompt_message(Some("/app"), true, false).contains('\x1b'));
+        assert!(!prompt_message(None, false, false).contains('\x1b'));
+    }
+
+    #[test]
+    fn label_prefix_colours_only_when_enabled() {
+        assert_eq!(label_prefix("clank", false), "clank");
+        assert!(label_prefix("clank", true).contains("\x1b[1;96mclank"));
+    }
+
     #[test]
     fn render_emits_stdout_then_stderr_and_notes_a_failure() {
         let result = EvalResult {
@@ -634,16 +796,20 @@ mod tests {
     }
 
     #[test]
-    fn shell_prompt_indicator_tracks_the_last_exit() {
-        // Green ❯ after a success, red ❯ after a failure.
-        assert_eq!(
-            shell_render_config(true).prompt_prefix.style.fg,
-            Some(Color::LightGreen)
+    fn prompt_message_marker_colour_tracks_the_last_exit() {
+        // With colour on, the `❯` marker is bright-green after a success and bright-red after a
+        // failure; the cwd stays blue regardless.
+        let ok = prompt_message(Some("/app"), true, true);
+        let fail = prompt_message(Some("/app"), false, true);
+        assert!(
+            ok.contains("\x1b[92m❯"),
+            "ok marker should be green: {ok:?}"
         );
-        assert_eq!(
-            shell_render_config(false).prompt_prefix.style.fg,
-            Some(Color::LightRed)
+        assert!(
+            fail.contains("\x1b[91m❯"),
+            "fail marker should be red: {fail:?}"
         );
+        assert!(ok.contains("\x1b[34m[/app]"), "cwd should be blue: {ok:?}");
     }
 
     // --- validate_interactive_surface -------------------------------------------------------
