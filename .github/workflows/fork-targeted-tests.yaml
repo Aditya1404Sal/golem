@@ -1,0 +1,88 @@
+# Fork only: runs the agent-counters hot_update tests and the failed-deletion test on a GitHub
+# runner. Main validation runs these on golemcloud/golem; this file never goes upstream.
+name: Fork targeted tests
+
+on:
+  push:
+    branches: ['ci/**']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  executor-tests:
+    if: github.repository != 'golemcloud/golem'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 345
+    env:
+      CARGO_INCREMENTAL: '0'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_TERM_COLOR: never
+      RUST_MIN_STACK: '33554432'
+    steps:
+      - name: Free disk space
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL /usr/local/share/boost /usr/share/swift
+          sudo docker image prune --all --force || true
+          df -h /
+
+      - uses: actions/checkout@v5
+
+      - name: Install build tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends build-essential libssl-dev clang lld cmake redis-server
+          sudo systemctl stop redis-server || true
+          rustup update stable --no-self-update
+          rustup default stable
+          rustup target add wasm32-wasip2
+          rustc --version
+
+      - name: Build the golem CLI
+        run: cargo build -p golem-cli --bin golem-cli
+
+      - name: Build agent-counters and agent-counters-v2
+        env:
+          GOLEM_RUST_PATH: ${{ github.workspace }}/sdks/rust/golem-rust
+        run: |
+          cli="$GITHUB_WORKSPACE/target/debug/golem-cli"
+          for app in agent-counters agent-counters-v2; do
+            (cd "test-components/$app" && "$cli" --preset release build --yes --skip-check && "$cli" --preset release exec copy)
+          done
+          ls -la test-components/it_agent_counters_release.wasm test-components/it_agent_counters_v2_release.wasm
+          df -h /
+
+      - name: Build the executor tests
+        run: |
+          cargo test -p golem-worker-executor-tests --test integration --no-run
+          df -h /
+
+      - name: Run the tests
+        shell: bash
+        working-directory: golem-worker-executor-tests
+        run: |
+          cargo test -p golem-worker-executor-tests --test integration -- \
+            hot_update::auto_update_on_idle_after_manual_update \
+            hot_update::a_snapshot_based_update_runs_a_target_initializer_that_makes_durable_calls \
+            hot_update::a_restart_right_after_a_snapshot_based_update_recovers_the_target_initializer_state \
+            hot_update::a_periodic_snapshot_after_a_snapshot_based_update_recovers_from_that_snapshot \
+            hot_update::a_failed_snapshot_based_update_keeps_the_source_and_its_initializer_state \
+            hot_update::an_interrupted_snapshot_based_update_attempt_replays_its_initializer_calls_on_the_next_attempt \
+            hot_update::a_divergent_bootstrap_block_fails_the_snapshot_based_update \
+            hot_update::a_snapshot_assisted_update_replays_the_source_initializer_block_for_its_target \
+            hot_update::a_snapshot_assisted_update_requested_right_after_its_record_recovers_the_target_initializer_state \
+            hot_update::a_failed_snapshot_assisted_update_keeps_the_source_and_its_initializer_state \
+            hot_update::a_snapshot_assisted_update_replays_a_source_tail_that_depends_on_the_initializer_seed \
+            hot_update::a_manual_update_whose_target_initializer_makes_a_write_fails_and_keeps_the_source \
+            api::calls_after_a_failed_deletion_get_the_deletion_refusal_without_a_panic \
+            --exact --nocapture --report-time 2>&1 | tee "$GITHUB_WORKSPACE/executor-tests.log"
+
+      - name: Keep the test log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: executor-tests-log
+          path: executor-tests.log
+          if-no-files-found: ignore
